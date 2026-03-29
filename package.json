@@ -1,6 +1,6 @@
 {
   "name": "sowel-plugin-netatmo-weather",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Sowel plugin: Netatmo Weather Station",
   "type": "module",
   "main": "dist/index.js",

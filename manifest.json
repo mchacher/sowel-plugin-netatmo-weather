@@ -1,7 +1,7 @@
 {
   "id": "netatmo_weather",
   "name": "Netatmo Weather",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Netatmo Weather Station — temperature, humidity, pressure, CO2, wind, rain",
   "icon": "CloudSun",
   "repo": "mchacher/sowel-plugin-netatmo-weather",

@@ -71,7 +71,7 @@ interface DeviceManager {
   migrateIntegrationId(
     oldIntegrationId: string,
     newIntegrationId: string,
-    sourceDeviceIds: string[],
+    models?: string[],
   ): number;
 }
 
@@ -548,6 +548,12 @@ class NetatmoWeatherPlugin implements IntegrationPlugin {
 
     const tokenFilePath = path.join(this.dataDir, "netatmo-weather-tokens.json");
 
+    // Migrate devices from legacy netatmo_hc BEFORE authentication (DB-only, no API needed)
+    if (!this.migrationDone) {
+      this.migrateFromLegacy();
+      this.migrationDone = true;
+    }
+
     try {
       this.bridge = new NetatmoBridge(
         clientId,
@@ -561,12 +567,6 @@ class NetatmoWeatherPlugin implements IntegrationPlugin {
       );
 
       await this.bridge.authenticate();
-
-      // Migrate devices from legacy netatmo_hc integration (one-time)
-      if (!this.migrationDone) {
-        await this.migrateFromLegacy();
-        this.migrationDone = true;
-      }
 
       // First poll
       await this.poll();
@@ -682,32 +682,20 @@ class NetatmoWeatherPlugin implements IntegrationPlugin {
   // Legacy migration (netatmo_hc → netatmo_weather)
   // ============================================================
 
-  private async migrateFromLegacy(): Promise<void> {
-    if (!this.bridge) return;
-
+  private migrateFromLegacy(): void {
     try {
-      // Discover what weather devices exist in the API
-      const stationsData = await this.bridge.getStationsData();
-      const sourceIds: string[] = [];
-
-      for (const station of stationsData.body.devices) {
-        sourceIds.push(station.module_name || station.station_name);
-        for (const mod of station.modules ?? []) {
-          sourceIds.push(mod.module_name || mod._id);
-        }
-      }
-
-      if (sourceIds.length === 0) return;
-
+      // Migrate weather devices by model name (DB-only, no API call needed).
+      // Safe to call before bridge authentication.
+      const WEATHER_MODELS = ["Indoor Station", "Outdoor Module", "Wind Gauge", "Rain Gauge", "Indoor Module"];
       const migrated = this.deviceManager.migrateIntegrationId(
         LEGACY_INTEGRATION_ID,
         INTEGRATION_ID,
-        sourceIds,
+        WEATHER_MODELS,
       );
 
       if (migrated > 0) {
         this.logger.info(
-          { migrated, sourceIds },
+          { migrated },
           "Migrated weather devices from netatmo_hc to netatmo_weather",
         );
       }

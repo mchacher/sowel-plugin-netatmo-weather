@@ -1,0 +1,38 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - run: npm ci
+
+      - run: npm run build
+
+      - name: Package pre-built tarball
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          PLUGIN_ID=$(node -p "require('./manifest.json').id")
+          tar czf sowel-plugin-${PLUGIN_ID}-${VERSION}.tar.gz manifest.json package.json dist/
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          PLUGIN_ID=$(node -p "require('./manifest.json').id")
+          gh release create ${{ github.ref_name }} \
+            sowel-plugin-${PLUGIN_ID}-${VERSION}.tar.gz \
+            --title "${{ github.ref_name }}" \
+            --generate-notes

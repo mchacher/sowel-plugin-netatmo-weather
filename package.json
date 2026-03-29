@@ -1,0 +1,16 @@
+{
+  "name": "sowel-plugin-netatmo-weather",
+  "version": "1.0.0",
+  "description": "Sowel plugin: Netatmo Weather Station",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "typescript": "^5.5.0"
+  },
+  "license": "AGPL-3.0"
+}

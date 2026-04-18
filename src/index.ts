@@ -49,7 +49,7 @@ interface DiscoveredDevice {
   orders: {
     key: string;
     type: string;
-    dispatchConfig: Record<string, unknown>;
+    dispatchConfig?: Record<string, unknown>;
     min?: number;
     max?: number;
     enumValues?: string[];
@@ -106,6 +106,7 @@ interface IntegrationPlugin {
   readonly name: string;
   readonly description: string;
   readonly icon: string;
+  readonly apiVersion?: number;
   getStatus(): IntegrationStatus;
   isConfigured(): boolean;
   getSettingsSchema(): IntegrationSettingDef[];
@@ -113,7 +114,7 @@ interface IntegrationPlugin {
   stop(): Promise<void>;
   executeOrder(
     device: Device,
-    dispatchConfig: Record<string, unknown>,
+    orderKeyOrDispatchConfig: string | Record<string, unknown>,
     value: unknown,
   ): Promise<void>;
   refresh?(): Promise<void>;
@@ -401,8 +402,8 @@ function mapModuleToDiscovered(mod: NetatmoStationModule): DiscoveredDevice {
 
   switch (mod.type) {
     case "NAModule1":
-      data.push({ key: "temperature", type: "number", category: "temperature", unit: "°C" });
-      data.push({ key: "humidity", type: "number", category: "humidity", unit: "%" });
+      data.push({ key: "temperature", type: "number", category: "temperature_outdoor", unit: "°C" });
+      data.push({ key: "humidity", type: "number", category: "humidity_outdoor", unit: "%" });
       break;
     case "NAModule2":
       data.push({ key: "wind_strength", type: "number", category: "wind", unit: "km/h" });
@@ -479,6 +480,7 @@ class NetatmoWeatherPlugin implements IntegrationPlugin {
   readonly name = "Netatmo Weather";
   readonly description = "Netatmo Weather Station — temperature, humidity, pressure, CO2, wind, rain";
   readonly icon = "CloudSun";
+  readonly apiVersion = 2;
 
   private logger: Logger;
   private eventBus: EventBus;
@@ -609,7 +611,7 @@ class NetatmoWeatherPlugin implements IntegrationPlugin {
 
   async executeOrder(
     _device: Device,
-    _dispatchConfig: Record<string, unknown>,
+    _orderKey: string,
     _value: unknown,
   ): Promise<void> {
     throw new Error("Netatmo Weather is read-only — no orders supported");

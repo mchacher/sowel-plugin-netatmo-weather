@@ -9,7 +9,10 @@
     "dev": "tsc --watch"
   },
   "devDependencies": {
-    "@types/node": "^25.5.0",
+    "@influxdata/influxdb-client": "^1.35.0",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^25.9.1",
+    "better-sqlite3": "^12.10.0",
     "typescript": "^5.5.0"
   },
   "license": "AGPL-3.0"

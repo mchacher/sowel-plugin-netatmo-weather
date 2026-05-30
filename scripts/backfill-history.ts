@@ -63,10 +63,14 @@ function getSetting(key: string): string | undefined {
   return row?.value;
 }
 
-const influxUrl = getSetting("history.influx.url");
-const influxToken = getSetting("history.influx.token");
-const influxOrg = getSetting("history.influx.org");
-const influxBucket = getSetting("history.influx.bucket");
+// Sowel resolves Influx config from env vars first (docker-compose injects
+// INFLUX_URL/TOKEN/ORG/BUCKET into the container), with SQLite settings as
+// a legacy fallback. Mirror that precedence so the script works inside the
+// container without further configuration.
+const influxUrl = process.env.INFLUX_URL ?? getSetting("history.influx.url");
+const influxToken = process.env.INFLUX_TOKEN ?? getSetting("history.influx.token");
+const influxOrg = process.env.INFLUX_ORG ?? getSetting("history.influx.org");
+const influxBucket = process.env.INFLUX_BUCKET ?? getSetting("history.influx.bucket");
 const netatmoClientId = getSetting("integration.netatmo_weather.client_id");
 const netatmoClientSecret = getSetting(
   "integration.netatmo_weather.client_secret",
@@ -199,16 +203,22 @@ for (const row of bindingRows) {
 // Netatmo: binding key → API "type"
 // ============================================================
 
-/** Maps the device-data `key` (or alias-stripped) to the Netatmo API `type`. */
-const KEY_TO_NETATMO_TYPE: Record<string, string> = {
+/** Maps the device-data `key` (or alias-stripped) to the Netatmo API `type`.
+ *
+ * Keys mapped to `null` are deliberately skipped — the Netatmo `getmeasure`
+ * endpoint refuses some derived fields (e.g. `sum_rain_1`, `sum_rain_24`)
+ * at scale=30min (the only scale we use, to align with Sowel's downsampling
+ * task input). For those, the live plugin still computes the values at each
+ * poll, but historical backfill is not available. */
+const KEY_TO_NETATMO_TYPE: Record<string, string | null> = {
   temperature: "Temperature",
   humidity: "Humidity",
   pressure: "Pressure",
   co2: "CO2",
   noise: "Noise",
   rain: "Rain",
-  sum_rain_1: "sum_rain_1",
-  sum_rain_24: "sum_rain_24",
+  sum_rain_1: null, // not retrievable at scale=30min — skipped
+  sum_rain_24: null, // ditto
   wind_strength: "WindStrength",
   wind_angle: "WindAngle",
   gust_strength: "Guststrength",
@@ -280,6 +290,60 @@ async function getAccessToken(): Promise<string> {
     return tokens.accessToken;
   }
   return refreshAccessToken();
+}
+
+// ============================================================
+// Resolve Netatmo MACs from module_name (Sowel's sourceDeviceId)
+// ============================================================
+//
+// The plugin upserts each Netatmo module as a Sowel device with
+// `sourceDeviceId = mod.module_name` (e.g. "Outdoor Module"). The
+// `getmeasure` API only accepts MAC addresses for `device_id` and
+// `module_id`. We resolve the mapping by calling `getstationsdata`
+// once at startup.
+
+interface NetatmoModuleMeta {
+  mac: string; // module's `_id` (= MAC address, used as module_id)
+  type: string; // NAModule1 / NAModule2 / NAModule3 / NAModule4 / NAMain
+  stationMac: string; // parent station's `_id`
+}
+
+async function resolveNetatmoMetas(): Promise<Map<string, NetatmoModuleMeta>> {
+  const token = await getAccessToken();
+  const res = await fetch(`${NETATMO_BASE}/api/getstationsdata`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) {
+    throw new Error(`getstationsdata failed: ${res.status} ${await res.text()}`);
+  }
+  const data = (await res.json()) as {
+    body?: {
+      devices?: {
+        _id: string;
+        module_name?: string;
+        station_name?: string;
+        type: string;
+        modules?: {
+          _id: string;
+          module_name?: string;
+          type: string;
+        }[];
+      }[];
+    };
+  };
+
+  const out = new Map<string, NetatmoModuleMeta>();
+  const devices = data.body?.devices ?? [];
+  for (const station of devices) {
+    const stationMac = station._id;
+    const stationName = station.module_name || station.station_name || station._id;
+    out.set(stationName, { mac: stationMac, type: station.type, stationMac });
+    for (const mod of station.modules ?? []) {
+      const modName = mod.module_name || mod._id;
+      out.set(modName, { mac: mod._id, type: mod.type, stationMac });
+    }
+  }
+  return out;
 }
 
 // ============================================================
@@ -374,7 +438,16 @@ interface DayResult {
 async function processGroupDay(
   group: ModuleGroup,
   day: Date,
+  metas: Map<string, NetatmoModuleMeta>,
 ): Promise<DayResult> {
+  // Translate Sowel sourceDeviceId (== module_name) → Netatmo MACs.
+  const moduleMeta = metas.get(group.sourceDeviceId);
+  const baseMeta = metas.get(group.baseSourceDeviceId);
+  if (!moduleMeta || !baseMeta) {
+    throw new Error(
+      `Cannot resolve MAC for module="${group.sourceDeviceId}" or base="${group.baseSourceDeviceId}" — Netatmo getstationsdata didn't return a match`,
+    );
+  }
   const dayStart = day;
   const dayEnd = addDays(day, 1);
   const dayStartTs = Math.floor(dayStart.getTime() / 1000);
@@ -386,7 +459,13 @@ async function processGroupDay(
   const positionToBinding: BindingRow[] = [];
   for (const b of group.bindings) {
     const key = aliasToKey(b.alias);
-    const netatmoType = KEY_TO_NETATMO_TYPE[key] ?? KEY_TO_NETATMO_TYPE[b.deviceKey];
+    // Two lookups because the alias may itself carry a numeric suffix that
+    // looks like a dedup tag but isn't (e.g. `sum_rain_1` is a real key).
+    const fromKey = key in KEY_TO_NETATMO_TYPE ? KEY_TO_NETATMO_TYPE[key] : undefined;
+    const fromDeviceKey =
+      b.deviceKey in KEY_TO_NETATMO_TYPE ? KEY_TO_NETATMO_TYPE[b.deviceKey] : undefined;
+    // `null` is a deliberate skip (vs `undefined` = unknown key)
+    const netatmoType = fromKey !== undefined ? fromKey : fromDeviceKey;
     if (!netatmoType) continue;
     apiTypes.push(netatmoType);
     positionToBinding.push(b);
@@ -395,7 +474,7 @@ async function processGroupDay(
 
   const accessToken = await getAccessToken();
   const params = new URLSearchParams({
-    device_id: group.baseSourceDeviceId,
+    device_id: baseMeta.mac,
     type: apiTypes.join(","),
     scale: "30min",
     optimize: "false",
@@ -403,14 +482,29 @@ async function processGroupDay(
     date_begin: String(dayStartTs),
     date_end: String(dayEndTs),
   });
-  // Only set module_id when the binding is on a module, not the base
-  if (group.sourceDeviceId !== group.baseSourceDeviceId) {
-    params.set("module_id", group.sourceDeviceId);
+  // Only set module_id when the binding is on a sub-module, not the base
+  if (moduleMeta.mac !== baseMeta.mac) {
+    params.set("module_id", moduleMeta.mac);
   }
-  const res = await fetch(
-    `${NETATMO_BASE}/api/getmeasure?${params.toString()}`,
-    { headers: { Authorization: `Bearer ${accessToken}` } },
-  );
+  // Netatmo enforces both a 10-second rolling window (~50 req/10s/user) and
+  // a per-hour quota (~500 req/h/app). One retry on 429 with a 65s pause is
+  // usually enough to clear the 10s window; for the per-hour cap, the user
+  // can re-run the script (idempotent per equipment+alias).
+  const callWithRetry = async (): Promise<Response> => {
+    let res = await fetch(
+      `${NETATMO_BASE}/api/getmeasure?${params.toString()}`,
+      { headers: { Authorization: `Bearer ${accessToken}` } },
+    );
+    if (res.status === 429) {
+      await sleep(65_000);
+      res = await fetch(
+        `${NETATMO_BASE}/api/getmeasure?${params.toString()}`,
+        { headers: { Authorization: `Bearer ${accessToken}` } },
+      );
+    }
+    return res;
+  };
+  const res = await callWithRetry();
   if (!res.ok) {
     throw new Error(
       `getmeasure ${group.deviceModel} ${day.toISOString().slice(0, 10)}: ${res.status} ${await res.text()}`,
@@ -525,7 +619,25 @@ async function run(): Promise<void> {
   console.log(`Range: ${from.toISOString().slice(0, 10)} → ${to.toISOString().slice(0, 10)} (${allDays.length} days)`);
   console.log(`Equipments: ${new Set(bindingRows.map((b) => b.equipmentName)).size}`);
   console.log(`Module groups: ${groups.size}`);
-  console.log(`Buckets: hourly=${hourlyBucket}, daily=${dailyBucket}\n`);
+  console.log(`Buckets: hourly=${hourlyBucket}, daily=${dailyBucket}`);
+
+  console.log("\nResolving Netatmo MACs via getstationsdata…");
+  const metas = await resolveNetatmoMetas();
+  console.log(`Resolved ${metas.size} (name → MAC) entries`);
+  for (const g of groups.values()) {
+    const m = metas.get(g.sourceDeviceId);
+    const b = metas.get(g.baseSourceDeviceId);
+    if (!m || !b) {
+      console.error(
+        `  ✗ Cannot resolve MACs for ${g.equipmentName} / ${g.deviceModel} (module="${g.sourceDeviceId}", base="${g.baseSourceDeviceId}")`,
+      );
+    } else {
+      console.log(
+        `  ✓ ${g.equipmentName} / ${g.deviceModel}: device_id=${b.mac.slice(0, 8)}…  module_id=${m.mac.slice(0, 8)}…  (${m.type})`,
+      );
+    }
+  }
+  console.log();
 
   // Idempotency: delete any existing hourly + daily points in the window
   // before we start, scoped to the equipments touched.
@@ -551,7 +663,7 @@ async function run(): Promise<void> {
       const day = allDays[i];
       const dateStr = day.toISOString().slice(0, 10);
       try {
-        const r = await processGroupDay(g, day);
+        const r = await processGroupDay(g, day, metas);
         if (r.rawPoints === 0) {
           process.stdout.write(`  ${dateStr}  ·  no data\n`);
         } else {

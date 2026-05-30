@@ -45,10 +45,26 @@ const NETATMO_BASE = "https://api.netatmo.com";
 
 const monthsArg = parseInt(process.argv[2] ?? "12", 10);
 if (isNaN(monthsArg) || monthsArg < 1 || monthsArg > 60) {
-  console.error("Usage: backfill-history.ts <months>   (1..60, default 12)");
+  console.error(
+    "Usage: backfill-history.ts <months> [--only=rain|outdoor|indoor|wind|all]   (months 1..60, default 12)",
+  );
   process.exit(1);
 }
 const MONTHS = monthsArg;
+
+/** Optional `--only=<filter>` flag to restrict processing to a subset of
+ * modules. Useful to recompute a single category (e.g. fix rain daily
+ * totals) without re-fetching everything else.
+ * Values: rain, outdoor, indoor, wind, all (default). */
+type ModuleFilter = "rain" | "outdoor" | "indoor" | "wind" | "all";
+const onlyArg = (process.argv.find((a) => a.startsWith("--only=")) ?? "--only=all")
+  .slice("--only=".length)
+  .toLowerCase() as ModuleFilter;
+if (!["rain", "outdoor", "indoor", "wind", "all"].includes(onlyArg)) {
+  console.error(`Invalid --only value: ${onlyArg}. Use rain|outdoor|indoor|wind|all.`);
+  process.exit(1);
+}
+const ONLY: ModuleFilter = onlyArg;
 
 // ============================================================
 // SQLite — settings + equipments + bindings + devices
@@ -606,6 +622,36 @@ async function processGroupDay(
       max: Math.max(...allValues),
     });
     for (const p of dailyPoints) dailyWrite.writePoint(p);
+
+    // For the Rain Gauge `rain` binding, also write a derived sum_rain_24
+    // daily point — the cumulative mm fallen on this calendar day, computed
+    // as the sum of the 30-min Rain slices. Netatmo's getmeasure refuses
+    // sum_rain_24 at scale=30min so this is the only way to backfill a
+    // sensible "mm/day" series. The live plugin will keep writing the live
+    // rolling 24h sum_rain_24 to the raw bucket on each poll; this daily
+    // bucket entry overrides the downsample task's mean(rolling) with a
+    // proper daily total.
+    if (b.deviceKey === "rain") {
+      const sumRain24Binding = group.bindings.find(
+        (x) => x.deviceKey === "sum_rain_24",
+      );
+      if (sumRain24Binding) {
+        const dailyTotal = allValues.reduce((a, v) => a + v, 0);
+        const sumPoints = buildAggPoint({
+          bucket: "daily",
+          equipmentId: sumRain24Binding.equipmentId,
+          zoneId: sumRain24Binding.zoneId,
+          alias: sumRain24Binding.alias,
+          category: sumRain24Binding.category,
+          type: sumRain24Binding.type,
+          timestampSec: dayStartTs,
+          mean: dailyTotal,
+          min: dailyTotal,
+          max: dailyTotal,
+        });
+        for (const p of sumPoints) dailyWrite.writePoint(p);
+      }
+    }
   }
 
   // Close both writers independently: if hourly throws (retention bound,
@@ -640,13 +686,37 @@ async function run(): Promise<void> {
   console.log(`\nNetatmo Weather backfill — ${MONTHS} months`);
   console.log(`Range: ${from.toISOString().slice(0, 10)} → ${to.toISOString().slice(0, 10)} (${allDays.length} days)`);
   console.log(`Equipments: ${new Set(bindingRows.map((b) => b.equipmentName)).size}`);
-  console.log(`Module groups: ${groups.size}`);
+  console.log(`Module groups: ${groups.size}  (--only=${ONLY})`);
   console.log(`Buckets: hourly=${hourlyBucket}, daily=${dailyBucket}`);
+
+  // Filter module groups according to the --only CLI flag.
+  //   rain    → NAModule3 (Rain Gauge)
+  //   outdoor → NAModule1 (Outdoor Module)
+  //   indoor  → NAMain (Indoor Station base) + NAModule4 (Indoor Module)
+  //   wind    → NAModule2 (Wind Gauge)
+  //   all     → everything
+  const FILTER_MODELS: Record<ModuleFilter, string[] | null> = {
+    rain: ["Rain Gauge"],
+    outdoor: ["Outdoor Module"],
+    indoor: ["Indoor Station", "Indoor Module"],
+    wind: ["Wind Gauge"],
+    all: null,
+  };
+  const allowedModels = FILTER_MODELS[ONLY];
+  const filteredGroups = allowedModels
+    ? new Map(
+        [...groups.entries()].filter(([, g]) => allowedModels.includes(g.deviceModel)),
+      )
+    : groups;
+  if (filteredGroups.size === 0) {
+    console.error(`No module group matches --only=${ONLY}. Nothing to do.`);
+    process.exit(0);
+  }
 
   console.log("\nResolving Netatmo MACs via getstationsdata…");
   const metas = await resolveNetatmoMetas();
   console.log(`Resolved ${metas.size} (name → MAC) entries`);
-  for (const g of groups.values()) {
+  for (const g of filteredGroups.values()) {
     const m = metas.get(g.sourceDeviceId);
     const b = metas.get(g.baseSourceDeviceId);
     if (!m || !b) {
@@ -661,24 +731,46 @@ async function run(): Promise<void> {
   }
   console.log();
 
-  // Idempotency: delete any existing hourly + daily points in the window
-  // before we start, scoped to the equipments touched.
-  for (const g of groups.values()) {
-    const aliasPredicate = g.bindings
-      .map((b) => `alias="${b.alias}"`)
-      .join(" OR ");
+  // Idempotency: delete ONLY the aliases this run will actually re-write or
+  // compute. Earlier versions wiped EVERY alias of the module group, which
+  // for Rain Gauge meant the live-written sum_rain_24 history got nuked
+  // without being restored (the Netatmo getmeasure endpoint refuses
+  // sum_rain_24 at scale=30min). Data-loss bug hit on sowelox 2026-05-30.
+  for (const g of filteredGroups.values()) {
+    const writableAliases = new Set<string>();
+    for (const b of g.bindings) {
+      const key = aliasToKey(b.alias);
+      const type =
+        key in KEY_TO_NETATMO_TYPE
+          ? KEY_TO_NETATMO_TYPE[key]
+          : b.deviceKey in KEY_TO_NETATMO_TYPE
+            ? KEY_TO_NETATMO_TYPE[b.deviceKey]
+            : undefined;
+      if (type) writableAliases.add(b.alias);
+    }
+    // Rain Gauge also produces a computed daily sum_rain_24 from the raw
+    // 30-min Rain values — include that alias too so re-runs don't double.
+    if (g.deviceModel === "Rain Gauge") {
+      for (const b of g.bindings) {
+        if (b.deviceKey === "sum_rain_24" || aliasToKey(b.alias) === "sum_rain_24") {
+          writableAliases.add(b.alias);
+        }
+      }
+    }
+    if (writableAliases.size === 0) continue;
+    const aliasPredicate = [...writableAliases].map((a) => `alias="${a}"`).join(" OR ");
     const predicate = `_measurement="equipment_data" AND equipmentId="${g.equipmentId}" AND (${aliasPredicate})`;
     await deleteRange(hourlyBucket, from, to, predicate);
     await deleteRange(dailyBucket, from, to, predicate);
   }
-  console.log("Existing window cleared. Starting fetch...\n");
+  console.log("Existing window cleared (only re-writable aliases). Starting fetch...\n");
 
   let totalRaw = 0;
   let totalHour = 0;
   let processedDays = 0;
   let errors = 0;
 
-  for (const g of groups.values()) {
+  for (const g of filteredGroups.values()) {
     console.log(`\n=== ${g.equipmentName} / ${g.deviceModel} ===`);
 
     for (let i = 0; i < allDays.length; i++) {

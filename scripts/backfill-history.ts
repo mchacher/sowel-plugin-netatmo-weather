@@ -514,6 +514,15 @@ async function processGroupDay(
     body: Record<string, (number | null)[]>;
   };
 
+  // The hourly bucket has a 90-day retention; trying to write a point
+  // older than that triggers an HTTP 422 from InfluxDB
+  // ("violates Retention Policy Lower Bound") and the WriteApi flush
+  // throws on close. Skip hourly writes for older days; daily-only is
+  // still useful (sowel-daily has a 5-year retention).
+  const HOURLY_RETENTION_DAYS = 90;
+  const hourlyCutoffMs = Date.now() - HOURLY_RETENTION_DAYS * 24 * 3600 * 1000;
+  const writeHourly = day.getTime() >= hourlyCutoffMs;
+
   // Collect raw 30-min points per binding
   // bindings[i] is keyed by alias
   const rawPerBinding = new Map<string, { ts: number; value: number }[]>();
@@ -561,22 +570,25 @@ async function processGroupDay(
       else perHour.set(hour, [p.value]);
     }
 
-    // Per-hour writes
-    for (const [hourTs, values] of perHour) {
-      const points = buildAggPoint({
-        bucket: "hourly",
-        equipmentId: b.equipmentId,
-        zoneId: b.zoneId,
-        alias: b.alias,
-        category: b.category,
-        type: b.type,
-        timestampSec: hourTs,
-        mean: values.reduce((a, b) => a + b, 0) / values.length,
-        min: Math.min(...values),
-        max: Math.max(...values),
-      });
-      for (const p of points) hourlyWrite.writePoint(p);
-      hourPointsCount++;
+    // Per-hour writes (skipped for days older than the hourly bucket's
+    // 90-day retention — InfluxDB would reject them).
+    if (writeHourly) {
+      for (const [hourTs, values] of perHour) {
+        const points = buildAggPoint({
+          bucket: "hourly",
+          equipmentId: b.equipmentId,
+          zoneId: b.zoneId,
+          alias: b.alias,
+          category: b.category,
+          type: b.type,
+          timestampSec: hourTs,
+          mean: values.reduce((a, b) => a + b, 0) / values.length,
+          min: Math.min(...values),
+          max: Math.max(...values),
+        });
+        for (const p of points) hourlyWrite.writePoint(p);
+        hourPointsCount++;
+      }
     }
 
     // Per-day write
@@ -596,8 +608,18 @@ async function processGroupDay(
     for (const p of dailyPoints) dailyWrite.writePoint(p);
   }
 
-  await hourlyWrite.close();
-  await dailyWrite.close();
+  // Close both writers independently: if hourly throws (retention bound,
+  // network glitch, …), daily can still finish flushing its own buffer.
+  const closeResults = await Promise.allSettled([
+    hourlyWrite.close(),
+    dailyWrite.close(),
+  ]);
+  const failures = closeResults.filter((r) => r.status === "rejected");
+  if (failures.length > 0) {
+    throw new Error(
+      `${failures.length}/${closeResults.length} writers failed: ${(failures[0] as PromiseRejectedResult).reason}`,
+    );
+  }
 
   return { rawPoints: rawCount, hourPoints: hourPointsCount };
 }

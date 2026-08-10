@@ -189,6 +189,9 @@ const BASE_URL = "https://api.netatmo.com";
 const REQUEST_TIMEOUT_MS = 30_000;
 const REFRESH_MARGIN_S = 300;
 const DEFAULT_POLL_INTERVAL_MS = 300_000;
+/** Consecutive poll failures before raising a system alarm (~30 min at the 5-min cadence). */
+const POLL_FAILURE_ALARM_THRESHOLD = 6;
+const POLL_ALARM_ID = "netatmo-weather-poll";
 
 const WEATHER_MODEL_NAMES: Record<string, string> = {
   NAMain: "Indoor Station",
@@ -199,10 +202,48 @@ const WEATHER_MODEL_NAMES: Record<string, string> = {
 };
 
 // ============================================================
+// Poll failure tracking (issue #2)
+// ============================================================
+
+/**
+ * Counts consecutive poll failures and decides when the system alarm
+ * should be raised (threshold reached) or resolved (first success after
+ * a raise). Pure state machine, exported for tests.
+ */
+export class PollFailureTracker {
+  private failures = 0;
+  private raised = false;
+
+  constructor(private readonly threshold: number) {}
+
+  get consecutiveFailures(): number {
+    return this.failures;
+  }
+
+  recordFailure(): "raise" | null {
+    this.failures += 1;
+    if (!this.raised && this.failures >= this.threshold) {
+      this.raised = true;
+      return "raise";
+    }
+    return null;
+  }
+
+  recordSuccess(): "resolve" | null {
+    this.failures = 0;
+    if (this.raised) {
+      this.raised = false;
+      return "resolve";
+    }
+    return null;
+  }
+}
+
+// ============================================================
 // OAuth Bridge (self-contained)
 // ============================================================
 
-class NetatmoBridge {
+export class NetatmoBridge {
   private logger: Logger;
   private clientId: string;
   private clientSecret: string;
@@ -352,10 +393,20 @@ class NetatmoBridge {
       await this.doRefreshToken();
     }
 
-    const res = await this.rawFetch(`${BASE_URL}${endpoint}`, {
-      method: "GET",
-      headers: { Authorization: `Bearer ${this.accessToken}` },
-    });
+    let res = await this.authorizedGet(endpoint);
+
+    if (res.status === 401 || res.status === 403) {
+      // A token we believe fresh got refused: revoked grant, or a
+      // refresh-token rotation race with another consumer of the same
+      // grant. Re-refresh once and retry immediately instead of failing
+      // every poll until the next scheduled refresh (issue #2).
+      this.logger.warn(
+        { endpoint, status: res.status },
+        "Access token refused — forcing token re-refresh",
+      );
+      await this.doRefreshToken();
+      res = await this.authorizedGet(endpoint);
+    }
 
     if (!res.ok) {
       const text = await res.text();
@@ -363,6 +414,13 @@ class NetatmoBridge {
     }
 
     return (await res.json()) as T;
+  }
+
+  private async authorizedGet(endpoint: string): Promise<Response> {
+    return this.rawFetch(`${BASE_URL}${endpoint}`, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${this.accessToken}` },
+    });
   }
 
   private async rawFetch(url: string, init: RequestInit): Promise<Response> {
@@ -490,6 +548,7 @@ class NetatmoWeatherPlugin implements IntegrationPlugin {
   private status: IntegrationStatus = "disconnected";
   private pollInterval: ReturnType<typeof setInterval> | null = null;
   private lastPollAt: string | null = null;
+  private failureTracker = new PollFailureTracker(POLL_FAILURE_ALARM_THRESHOLD);
   private pollIntervalMs = DEFAULT_POLL_INTERVAL_MS;
   private retryTimeout: ReturnType<typeof setTimeout> | null = null;
   private retryCount = 0;
@@ -672,11 +731,30 @@ class NetatmoWeatherPlugin implements IntegrationPlugin {
 
     this.lastPollAt = new Date().toISOString();
     this.logger.info({ stationCount: devices.length }, "Weather poll complete");
+
+    if (this.failureTracker.recordSuccess() === "resolve") {
+      this.eventBus.emit({
+        type: "system.alarm.resolved",
+        alarmId: POLL_ALARM_ID,
+        source: INTEGRATION_ID,
+        message: "Netatmo Weather polling recovered",
+      });
+    }
   }
 
   private safePoll(): void {
     this.poll().catch((err) => {
       this.logger.warn({ err } as Record<string, unknown>, "Weather poll failed");
+      if (this.failureTracker.recordFailure() === "raise") {
+        const msg = err instanceof Error ? err.message : String(err);
+        this.eventBus.emit({
+          type: "system.alarm.raised",
+          alarmId: POLL_ALARM_ID,
+          level: "error",
+          source: INTEGRATION_ID,
+          message: `Netatmo Weather polling failing (${this.failureTracker.consecutiveFailures} consecutive errors) — last error: ${msg}`,
+        });
+      }
     });
   }
 

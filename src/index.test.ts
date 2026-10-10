@@ -8,6 +8,7 @@ import {
   createPlugin,
   nextBackfillWindow,
   parseRainHours,
+  recentReadStart,
 } from "./index.js";
 
 // ============================================================
@@ -227,32 +228,53 @@ describe("nextBackfillWindow", () => {
     const recentStart = CURRENT_HOUR - 3 * H;
     expect(nextBackfillWindow(NOW_S, null)).toEqual({
       begin: recentStart - 168 * H,
-      end: recentStart - 1,
+      end: recentStart + 1800,
     });
   });
 
   it("continues before the oldest hour already backfilled", () => {
     const oldest = CURRENT_HOUR - 30 * 86_400;
-    expect(nextBackfillWindow(NOW_S, oldest)).toEqual({ begin: oldest - 168 * H, end: oldest - 1 });
+    expect(nextBackfillWindow(NOW_S, oldest)).toEqual({
+      begin: oldest - 168 * H,
+      end: oldest + 1800,
+    });
   });
 
   it("stops at 364 days, clamping the last step", () => {
     const limit = CURRENT_HOUR - 364 * 86_400;
-    expect(nextBackfillWindow(NOW_S, limit + 10 * H)).toEqual({ begin: limit, end: limit + 10 * H - 1 });
+    expect(nextBackfillWindow(NOW_S, limit + 10 * H)).toEqual({
+      begin: limit,
+      end: limit + 10 * H + 1800,
+    });
     expect(nextBackfillWindow(NOW_S, limit)).toBeNull();
   });
 
-  it("covers a year in about 52 steps without overlap", () => {
+  it("covers a year in about 52 steps, each reaching half an hour into the previous one", () => {
     let to: number | null = null;
     let steps = 0;
     let previousBegin = Infinity;
     for (let w = nextBackfillWindow(NOW_S, to); w; w = nextBackfillWindow(NOW_S, to)) {
-      expect(w.end).toBe(previousBegin === Infinity ? CURRENT_HOUR - 3 * H - 1 : previousBegin - 1);
+      expect(w.end).toBe((previousBegin === Infinity ? CURRENT_HOUR - 3 * H : previousBegin) + 1800);
       previousBegin = w.begin;
       to = w.begin;
       steps++;
     }
     expect(steps).toBe(52);
+  });
+});
+
+describe("recentReadStart", () => {
+  it("reads the last 3 hours in steady state", () => {
+    expect(recentReadStart(NOW_S, null)).toBe(CURRENT_HOUR - 3 * H);
+    expect(recentReadStart(NOW_S, CURRENT_HOUR)).toBe(CURRENT_HOUR - 3 * H);
+  });
+
+  it("catches up from the newest hour already read after an outage", () => {
+    expect(recentReadStart(NOW_S, CURRENT_HOUR - 10 * H)).toBe(CURRENT_HOUR - 10 * H);
+  });
+
+  it("never reaches further back than 1000 hours", () => {
+    expect(recentReadStart(NOW_S, CURRENT_HOUR - 5000 * H)).toBe(CURRENT_HOUR - 1000 * H);
   });
 });
 
@@ -410,5 +432,75 @@ describe("Netatmo Weather plugin — hourly rain", () => {
     await p.stop();
     expect(rainUpdates()).toHaveLength(0);
     expect(updates.some((u) => u.device === "Pluviomètre")).toBe(true);
+  });
+
+  const SETTING = (k: string) => `integration.netatmo_weather.${k}.${rainModule._id}`;
+  const measureQueries = () =>
+    fetchMock.mock.calls
+      .map((c) => String(c[0]))
+      .filter((u) => u.includes("/api/getmeasure"))
+      .map((u) => new URL(u).searchParams);
+
+  function routes(onMeasure: (q: URLSearchParams) => Response) {
+    fetchMock.mockImplementation(async (url: string) => {
+      if (url.includes("/oauth2/token")) return tokenResponse("t");
+      if (url.includes("/api/getstationsdata")) {
+        return new Response(JSON.stringify({ body: { devices: [station] }, status: "ok" }), {
+          status: 200,
+        });
+      }
+      return onMeasure(new URL(url).searchParams);
+    });
+  }
+
+  it("still publishes the recent hours when the backfill step fails, and skips it after 3 failures", async () => {
+    routes((q) =>
+      q.get("date_end")
+        ? new Response("range refused", { status: 400 })
+        : measure({ [CURRENT_HOUR - H]: 0.4, [CURRENT_HOUR]: 0.1 }),
+    );
+    const p = plugin();
+    await p.start();
+    expect(rainUpdates().map((u) => u.ts)).toEqual([CURRENT_HOUR - H, CURRENT_HOUR]);
+    expect(settings.get(SETTING("rain_backfill"))).toBeUndefined();
+    await p.refresh!();
+    expect(settings.get(SETTING("rain_backfill"))).toBeUndefined();
+    await p.refresh!();
+    await p.stop();
+    // third failure: the step is skipped, the next poll moves on
+    expect(Number(settings.get(SETTING("rain_backfill")))).toBe(CURRENT_HOUR - 3 * H - 168 * H);
+  });
+
+  it("sends an hour once more after it closes, even with the same total", async () => {
+    settings.set(SETTING("rain_backfill"), String(CURRENT_HOUR - 364 * 86_400));
+    routes(() =>
+      measure(
+        Date.now() / 1000 < CURRENT_HOUR + H
+          ? { [CURRENT_HOUR]: 0.1 }
+          : { [CURRENT_HOUR]: 0.1, [CURRENT_HOUR + H]: 0 },
+      ),
+    );
+    const p = plugin();
+    await p.start();
+    vi.setSystemTime((CURRENT_HOUR + H + 300) * 1000);
+    updates.length = 0;
+    await p.refresh!();
+    await p.stop();
+    expect(rainUpdates().map((u) => [u.ts, u.payload.rain])).toEqual([
+      [CURRENT_HOUR, 0.1],
+      [CURRENT_HOUR + H, 0],
+    ]);
+  });
+
+  it("catches up the hours missed during an outage", async () => {
+    settings.set(SETTING("rain_backfill"), String(CURRENT_HOUR - 364 * 86_400));
+    settings.set(SETTING("rain_synced_to"), String(CURRENT_HOUR - 10 * H));
+    routes(() => measure({ [CURRENT_HOUR - 9 * H]: 2, [CURRENT_HOUR]: 0.1 }));
+    const p = plugin();
+    await p.start();
+    await p.stop();
+    expect(measureQueries()[0].get("date_begin")).toBe(String(CURRENT_HOUR - 10 * H));
+    expect(rainUpdates().map((u) => u.ts)).toEqual([CURRENT_HOUR - 9 * H, CURRENT_HOUR]);
+    expect(settings.get(SETTING("rain_synced_to"))).toBe(String(CURRENT_HOUR));
   });
 });

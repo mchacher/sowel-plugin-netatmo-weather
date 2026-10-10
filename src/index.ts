@@ -213,6 +213,10 @@ const RAIN_RECENT_HOURS = 3;
 const RAIN_BACKFILL_DAYS = 364;
 /** Hours backfilled per poll, so the history is rewritten without flooding the core. */
 const RAIN_BACKFILL_STEP_HOURS = 7 * 24;
+/** Consecutive failures of one backfill step before it is skipped, so it cannot stall forever. */
+const RAIN_BACKFILL_MAX_FAILURES = 3;
+/** How far back the recent read catches up after an outage (getmeasure returns at most 1024 values). */
+const RAIN_CATCH_UP_HOURS = 1000;
 
 const WEATHER_MODEL_NAMES: Record<string, string> = {
   NAMain: "Indoor Station",
@@ -292,9 +296,10 @@ export function parseRainHours(body: unknown): RainHour[] {
 /**
  * Next backfill step: the week of hours just before `backfilledTo` (the oldest
  * hour already backfilled, epoch s), or before the recent hours on the first
- * step. Null once the backfill has reached {@link RAIN_BACKFILL_DAYS}. `end` is
- * one second before the previous step's start, so each hour, stamped at its
- * middle, falls in exactly one step.
+ * step. Null once the backfill has reached {@link RAIN_BACKFILL_DAYS}. `end`
+ * reaches half an hour into the previous step, so the boundary hour is read
+ * twice whatever way Netatmo bounds `date_end`: sending an hour again is
+ * harmless, a hole is not.
  */
 export function nextBackfillWindow(
   nowS: number,
@@ -304,7 +309,19 @@ export function nextBackfillWindow(
   const from = backfilledTo ?? current - RAIN_RECENT_HOURS * 3600;
   const limit = current - RAIN_BACKFILL_DAYS * 86_400;
   if (from <= limit) return null;
-  return { begin: Math.max(from - RAIN_BACKFILL_STEP_HOURS * 3600, limit), end: from - 1 };
+  return { begin: Math.max(from - RAIN_BACKFILL_STEP_HOURS * 3600, limit), end: from + 1800 };
+}
+
+/**
+ * Where the recent read starts: the last {@link RAIN_RECENT_HOURS}, or further
+ * back to the newest hour already read (`syncedTo`) after an outage, within
+ * {@link RAIN_CATCH_UP_HOURS}.
+ */
+export function recentReadStart(nowS: number, syncedTo: number | null): number {
+  const current = floorHour(nowS);
+  const recent = current - RAIN_RECENT_HOURS * 3600;
+  if (syncedTo === null || syncedTo >= recent) return recent;
+  return Math.max(syncedTo, current - RAIN_CATCH_UP_HOURS * 3600);
 }
 
 // ============================================================
@@ -645,6 +662,10 @@ class NetatmoWeatherPlugin implements IntegrationPlugin {
   private dataDir: string;
   /** Rain hours last published, per module, so a poll only resends what changed. */
   private publishedRain = new Map<string, Map<number, number>>();
+  /** Hours sent while still open, per module: each is sent once more after it closes. */
+  private openRainHours = new Map<string, Set<number>>();
+  /** Consecutive failures of the pending backfill step, per module. */
+  private backfillFailures = new Map<string, number>();
 
   constructor(deps: PluginDeps) {
     this.logger = deps.logger;
@@ -841,58 +862,100 @@ class NetatmoWeatherPlugin implements IntegrationPlugin {
    * Publish Netatmo's hourly rain totals: one backfill step, then the recent
    * hours, each with `sourceTimestamp` = its hour start. Sowel writes an hour
    * that is already over straight to its hourly history, so a late or
-   * corrected hour, and the backfill, land where they belong. A failure here
-   * never fails the poll: the other readings are still good.
+   * corrected hour, and the backfill, land where they belong. The two reads
+   * fail apart, and neither fails the poll: the other readings are still good.
    */
   private async syncRainHours(stationId: string, moduleId: string, modName: string): Promise<void> {
     if (!this.bridge) return;
     const nowS = Math.floor(Date.now() / 1000);
-    try {
-      const key = `rain_backfill.${moduleId}`;
-      const saved = Number(this.getSetting(key));
-      const window = nextBackfillWindow(nowS, Number.isFinite(saved) && saved > 0 ? saved : null);
-      if (window) {
-        const hours = await this.bridge.getRainHours(stationId, moduleId, window.begin, window.end);
-        this.publishRainHours(moduleId, modName, hours, { onlyChanged: false });
-        this.settingsManager.set(`${SETTINGS_PREFIX}${key}`, String(window.begin));
-        this.logger.info(
-          { moduleId, hours: hours.length, from: new Date(window.begin * 1000).toISOString() },
-          "Rain history backfill step",
-        );
-      }
+    await this.backfillRainStep(stationId, moduleId, modName, nowS);
 
+    const syncedKey = `rain_synced_to.${moduleId}`;
+    const synced = Number(this.getSetting(syncedKey));
+    try {
       const recent = await this.bridge.getRainHours(
         stationId,
         moduleId,
-        floorHour(nowS) - RAIN_RECENT_HOURS * 3600,
+        recentReadStart(nowS, Number.isFinite(synced) && synced > 0 ? synced : null),
       );
-      this.publishRainHours(moduleId, modName, recent, { onlyChanged: true });
+      this.publishRecentRainHours(moduleId, modName, recent, nowS);
+      const newest = recent[recent.length - 1];
+      if (newest) this.settingsManager.set(`${SETTINGS_PREFIX}${syncedKey}`, String(newest.hourStart));
     } catch (err) {
       this.logger.warn({ err, moduleId } as Record<string, unknown>, "Hourly rain fetch failed");
     }
   }
 
+  /** One backfill step, skipped after repeated failures so it can never stall. */
+  private async backfillRainStep(
+    stationId: string,
+    moduleId: string,
+    modName: string,
+    nowS: number,
+  ): Promise<void> {
+    if (!this.bridge) return;
+    const key = `rain_backfill.${moduleId}`;
+    const saved = Number(this.getSetting(key));
+    const window = nextBackfillWindow(nowS, Number.isFinite(saved) && saved > 0 ? saved : null);
+    if (!window) return;
+    try {
+      const hours = await this.bridge.getRainHours(stationId, moduleId, window.begin, window.end);
+      for (const h of hours) {
+        this.deviceManager.updateDeviceData(INTEGRATION_ID, modName, { rain: h.mm }, h.hourStart);
+      }
+      this.backfillFailures.delete(moduleId);
+      this.settingsManager.set(`${SETTINGS_PREFIX}${key}`, String(window.begin));
+      this.logger.info(
+        { moduleId, hours: hours.length, from: new Date(window.begin * 1000).toISOString() },
+        "Rain history backfill step",
+      );
+    } catch (err) {
+      const failures = (this.backfillFailures.get(moduleId) ?? 0) + 1;
+      if (failures < RAIN_BACKFILL_MAX_FAILURES) {
+        this.backfillFailures.set(moduleId, failures);
+        this.logger.warn({ err, moduleId, failures } as Record<string, unknown>, "Rain backfill step failed");
+        return;
+      }
+      this.backfillFailures.delete(moduleId);
+      this.settingsManager.set(`${SETTINGS_PREFIX}${key}`, String(window.begin));
+      this.logger.warn(
+        { err, moduleId, from: new Date(window.begin * 1000).toISOString() } as Record<string, unknown>,
+        "Rain backfill step skipped after repeated failures",
+      );
+    }
+  }
+
   /**
-   * Send rain hours oldest first. With `onlyChanged`, an hour already sent
-   * with the same total is skipped, except the newest: it is always sent last,
-   * so the device's live `rain` ends on the latest hour, not on a backfilled one.
+   * Send the recent hours oldest first, each only if its total changed, with
+   * two exceptions. An hour sent while it was still open is sent once more
+   * after it closes: Sowel then writes its final total to the hourly history,
+   * over whatever the downsample made of it (old 5-minute samples on the
+   * upgrade hour, or a last push flushed after the downsample ran). And the
+   * newest hour is always sent last, so the live `rain` is the latest hour.
    */
-  private publishRainHours(
+  private publishRecentRainHours(
     moduleId: string,
     modName: string,
     hours: RainHour[],
-    { onlyChanged }: { onlyChanged: boolean },
+    nowS: number,
   ): void {
+    const current = floorHour(nowS);
     const sent = this.publishedRain.get(moduleId) ?? new Map<number, number>();
+    const open = this.openRainHours.get(moduleId) ?? new Set<number>();
     hours.forEach((h, i) => {
       const newest = i === hours.length - 1;
-      if (onlyChanged && !newest && sent.get(h.hourStart) === h.mm) return;
+      const closedSinceSent = h.hourStart < current && open.has(h.hourStart);
+      if (!newest && !closedSinceSent && sent.get(h.hourStart) === h.mm) return;
       this.deviceManager.updateDeviceData(INTEGRATION_ID, modName, { rain: h.mm }, h.hourStart);
-      if (onlyChanged) sent.set(h.hourStart, h.mm);
+      sent.set(h.hourStart, h.mm);
+      if (h.hourStart >= current) open.add(h.hourStart);
+      else open.delete(h.hourStart);
     });
-    const cutoff = floorHour(Date.now() / 1000) - (RAIN_RECENT_HOURS + 1) * 3600;
+    const cutoff = current - (RAIN_RECENT_HOURS + 1) * 3600;
     for (const hourStart of sent.keys()) if (hourStart < cutoff) sent.delete(hourStart);
+    for (const hourStart of open) if (hourStart < cutoff) open.delete(hourStart);
     this.publishedRain.set(moduleId, sent);
+    this.openRainHours.set(moduleId, open);
   }
 
   private safePoll(): void {

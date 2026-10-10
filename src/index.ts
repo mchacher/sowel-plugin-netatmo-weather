@@ -162,6 +162,7 @@ interface NetatmoStationDevice {
   wifi_status: number;
   dashboard_data: NetatmoDashboard;
   modules?: NetatmoStationModule[];
+  place?: { timezone?: string };
 }
 
 interface NetatmoStationModule {
@@ -218,6 +219,8 @@ const POLL_ALARM_ID = "netatmo-weather-poll";
  * 24 hours (`sum_rain_24`), late uploads from Netatmo and a failed poll.
  */
 const RAIN_RECENT_HOURS = 23;
+/** Hours before the current one in the rolling 24 hours (`sum_rain_24`); kept apart from the re-read depth. */
+const RAIN_ROLLING_PAST_HOURS = 23;
 /** How far back the backfill reaches, inside Sowel's one-year rain retention. */
 const RAIN_BACKFILL_DAYS = 364;
 /**
@@ -326,12 +329,54 @@ export function nextBackfillWindow(
 
 /**
  * Rain over the rolling 24 hours, to the hour: the current hour so far plus
- * the {@link RAIN_RECENT_HOURS} before it. Hours without a total had no rain.
+ * the {@link RAIN_ROLLING_PAST_HOURS} before it. Hours without a total had no rain.
  */
 export function rolling24h(hours: RainHour[], nowS: number): number {
-  const first = floorHour(nowS) - RAIN_RECENT_HOURS * 3600;
+  const first = floorHour(nowS) - RAIN_ROLLING_PAST_HOURS * 3600;
   const sum = hours.filter((h) => h.hourStart >= first).reduce((acc, h) => acc + h.mm, 0);
   return Math.round(sum * 1000) / 1000;
+}
+
+/** `YYYY-MM-DD` of an instant in `timeZone` (the process's zone if unknown or invalid). */
+function calendarDay(epochS: number, timeZone?: string): string {
+  const opts = { year: "numeric", month: "2-digit", day: "2-digit" } as const;
+  let f: Intl.DateTimeFormat;
+  try {
+    f = new Intl.DateTimeFormat("en-CA", { ...opts, timeZone });
+  } catch {
+    f = new Intl.DateTimeFormat("en-CA", opts);
+  }
+  return f.format(new Date(epochS * 1000));
+}
+
+/**
+ * Netatmo's since-midnight total, as `rain_today`: 0 when the dashboard was
+ * captured before the station's local midnight (a poll at 00:03 can read the
+ * 23:55 dashboard, which still holds yesterday's total).
+ */
+export function rainToday(
+  dashboard: { sum_rain_24?: number; time_utc?: number },
+  nowS: number,
+  timeZone?: string,
+): number | undefined {
+  if (dashboard.sum_rain_24 === undefined) return undefined;
+  if (dashboard.time_utc !== undefined && calendarDay(dashboard.time_utc, timeZone) !== calendarDay(nowS, timeZone)) {
+    return 0;
+  }
+  return dashboard.sum_rain_24;
+}
+
+/**
+ * `sum_rain_24` from the hourly totals, never below what the dashboard already
+ * says fell inside the window (rain today, the last hour): Netatmo's hourly
+ * aggregate can lag its dashboard, and missing hours must not read as no rain.
+ */
+export function rollingRain24h(
+  hours: RainHour[],
+  nowS: number,
+  floors: Array<number | undefined>,
+): number {
+  return Math.max(rolling24h(hours, nowS), ...floors.filter((v): v is number => typeof v === "number"));
 }
 
 /**
@@ -621,6 +666,7 @@ function mapModuleToDiscovered(mod: NetatmoStationModule): DiscoveredDevice {
 function extractDashboardPayload(
   dashboard: NetatmoDashboard,
   moduleType: string,
+  timeZone?: string,
 ): Record<string, unknown> {
   const payload: Record<string, unknown> = {};
 
@@ -648,7 +694,9 @@ function extractDashboardPayload(
       if (dashboard.sum_rain_1 !== undefined) payload.sum_rain_1 = dashboard.sum_rain_1;
       // Netatmo's sum_rain_24 is the rain since midnight: Sowel's rain_today.
       // sum_rain_24, the rolling 24 hours, is summed from the hourly totals.
-      if (dashboard.sum_rain_24 !== undefined) payload.rain_today = dashboard.sum_rain_24;
+      if (dashboard.sum_rain_24 !== undefined) {
+        payload.rain_today = rainToday(dashboard, Math.floor(Date.now() / 1000), timeZone);
+      }
       break;
     case "NAModule4":
       if (dashboard.Temperature !== undefined) payload.temperature = dashboard.Temperature;
@@ -857,7 +905,7 @@ class NetatmoWeatherPlugin implements IntegrationPlugin {
         this.deviceManager.upsertFromDiscovery(INTEGRATION_ID, INTEGRATION_ID, modDiscovered);
 
         const modPayload: Record<string, unknown> = mod.dashboard_data
-          ? extractDashboardPayload(mod.dashboard_data, mod.type)
+          ? extractDashboardPayload(mod.dashboard_data, mod.type, station.place?.timezone)
           : {};
         if (mod.battery_percent !== undefined) {
           modPayload.battery = mod.battery_percent;
@@ -865,7 +913,10 @@ class NetatmoWeatherPlugin implements IntegrationPlugin {
         this.deviceManager.updateDeviceData(INTEGRATION_ID, modName, modPayload);
 
         if (mod.type === "NAModule3") {
-          await this.syncRainHours(station._id, mod._id, modName);
+          await this.syncRainHours(station._id, mod._id, modName, [
+            modPayload.rain_today as number | undefined,
+            modPayload.sum_rain_1 as number | undefined,
+          ]);
         }
       }
     }
@@ -891,7 +942,12 @@ class NetatmoWeatherPlugin implements IntegrationPlugin {
    * also gives the rolling 24 hours (`sum_rain_24`). The two reads fail apart,
    * and neither fails the poll: the other readings are still good.
    */
-  private async syncRainHours(stationId: string, moduleId: string, modName: string): Promise<void> {
+  private async syncRainHours(
+    stationId: string,
+    moduleId: string,
+    modName: string,
+    floors: Array<number | undefined>,
+  ): Promise<void> {
     if (!this.bridge) return;
     const nowS = Math.floor(Date.now() / 1000);
     await this.backfillRainStep(stationId, moduleId, modName, nowS);
@@ -905,14 +961,19 @@ class NetatmoWeatherPlugin implements IntegrationPlugin {
         recentReadStart(nowS, Number.isFinite(synced) && synced > 0 ? synced : null),
       );
       this.publishRecentRainHours(moduleId, modName, recent, nowS);
-      this.deviceManager.updateDeviceData(INTEGRATION_ID, modName, {
-        sum_rain_24: rolling24h(recent, nowS),
-      });
       const newest = recent[recent.length - 1];
       if (newest) this.settingsManager.set(`${SETTINGS_PREFIX}${syncedKey}`, String(newest.hourStart));
     } catch (err) {
       this.logger.warn({ err, moduleId } as Record<string, unknown>, "Hourly rain fetch failed");
     }
+    // From the hours known so far, even when this read failed: rain older
+    // than 24 h ages out instead of freezing sum_rain_24 at its last value.
+    const known = [...(this.publishedRain.get(moduleId) ?? new Map<number, number>())].map(
+      ([hourStart, mm]) => ({ hourStart, mm }),
+    );
+    this.deviceManager.updateDeviceData(INTEGRATION_ID, modName, {
+      sum_rain_24: rollingRain24h(known, nowS, floors),
+    });
   }
 
   /** One backfill step, skipped after repeated failures so it can never stall. */

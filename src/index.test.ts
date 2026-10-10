@@ -8,7 +8,9 @@ import {
   createPlugin,
   nextBackfillWindow,
   parseRainHours,
+  rainToday,
   recentReadStart,
+  rollingRain24h,
   rolling24h,
 } from "./index.js";
 
@@ -287,6 +289,30 @@ describe("rolling24h", () => {
   });
 });
 
+describe("rainToday", () => {
+  const PARIS = "Europe/Paris";
+  it("passes Netatmo's since-midnight total through", () => {
+    expect(rainToday({ sum_rain_24: 4.2, time_utc: NOW_S - 300 }, NOW_S, PARIS)).toBe(4.2);
+  });
+
+  it("is 0 when the dashboard was captured before the station's midnight", () => {
+    // 00:03 in Paris (22:03 UTC, CEST), dashboard from 23:55 the day before
+    const now = Date.UTC(2026, 9, 9, 22, 3) / 1000;
+    expect(rainToday({ sum_rain_24: 8.2, time_utc: now - 8 * 60 }, now, PARIS)).toBe(0);
+  });
+
+  it("is undefined without a value", () => {
+    expect(rainToday({}, NOW_S, PARIS)).toBeUndefined();
+  });
+});
+
+describe("rollingRain24h", () => {
+  it("never reads below rain the dashboard already counted in the window", () => {
+    expect(rollingRain24h([], NOW_S, [8.2, 3.1])).toBe(8.2);
+    expect(rollingRain24h([{ hourStart: CURRENT_HOUR, mm: 9 }], NOW_S, [8.2, undefined])).toBe(9);
+  });
+});
+
 describe("recentReadStart", () => {
   it("reads the rolling 24 hours in steady state", () => {
     expect(recentReadStart(NOW_S, null)).toBe(CURRENT_HOUR - 23 * H);
@@ -418,7 +444,8 @@ describe("Netatmo Weather plugin — hourly rain", () => {
     await p.start();
     await p.stop();
     const rolling = updates.filter((u) => "sum_rain_24" in u.payload);
-    expect(rolling).toEqual([{ device: "Pluviomètre", payload: { sum_rain_24: 2 }, ts: undefined }]);
+    // 1.5 + 0.4 + 0.1 = 2, floored by the dashboard's rain today (2.1)
+    expect(rolling).toEqual([{ device: "Pluviomètre", payload: { sum_rain_24: 2.1 }, ts: undefined }]);
     expect(measureQueries()[0].get("date_begin")).toBe(String(CURRENT_HOUR - 31 * H));
   });
 
@@ -570,5 +597,24 @@ describe("Netatmo Weather plugin — hourly rain", () => {
     expect(measureQueries()[0].get("date_begin")).toBe(String(CURRENT_HOUR - 40 * H));
     expect(rainUpdates().map((u) => u.ts)).toEqual([CURRENT_HOUR - 39 * H, CURRENT_HOUR]);
     expect(settings.get(SETTING("rain_synced_to"))).toBe(String(CURRENT_HOUR));
+  });
+
+  it("lets sum_rain_24 age out when the hourly read fails, instead of freezing it", async () => {
+    settings.set(SETTING("rain_backfill"), String(CURRENT_HOUR - 364 * 86_400));
+    station.dashboard_data = { Temperature: 20 };
+    const dash = rainModule.dashboard_data;
+    rainModule.dashboard_data = { Rain: 0, sum_rain_1: 0, sum_rain_24: 0, time_utc: NOW_S - 300 };
+    routes(() => measure({ [CURRENT_HOUR - H]: 12 }));
+    const p = plugin();
+    await p.start();
+    // 25 hours later, every hourly read fails
+    vi.setSystemTime((NOW_S + 25 * H) * 1000);
+    rainModule.dashboard_data = { Rain: 0, sum_rain_1: 0, sum_rain_24: 0, time_utc: NOW_S + 25 * H - 300 };
+    routes(() => new Response("too many", { status: 429 }));
+    updates.length = 0;
+    await p.refresh!();
+    await p.stop();
+    rainModule.dashboard_data = dash;
+    expect(updates.filter((u) => "sum_rain_24" in u.payload).map((u) => u.payload.sum_rain_24)).toEqual([0]);
   });
 });

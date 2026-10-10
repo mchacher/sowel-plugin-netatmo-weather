@@ -224,10 +224,10 @@ describe("parseRainHours", () => {
 });
 
 describe("nextBackfillWindow", () => {
-  it("starts with the week before the recent hours", () => {
+  it("starts with the 1000 hours before the recent hours", () => {
     const recentStart = CURRENT_HOUR - 3 * H;
     expect(nextBackfillWindow(NOW_S, null)).toEqual({
-      begin: recentStart - 168 * H,
+      begin: recentStart - 1000 * H,
       end: recentStart + 1800,
     });
   });
@@ -235,7 +235,7 @@ describe("nextBackfillWindow", () => {
   it("continues before the oldest hour already backfilled", () => {
     const oldest = CURRENT_HOUR - 30 * 86_400;
     expect(nextBackfillWindow(NOW_S, oldest)).toEqual({
-      begin: oldest - 168 * H,
+      begin: oldest - 1000 * H,
       end: oldest + 1800,
     });
   });
@@ -249,7 +249,7 @@ describe("nextBackfillWindow", () => {
     expect(nextBackfillWindow(NOW_S, limit)).toBeNull();
   });
 
-  it("covers a year in about 52 steps, each reaching half an hour into the previous one", () => {
+  it("covers a year in 9 steps, each reaching half an hour into the previous one", () => {
     let to: number | null = null;
     let steps = 0;
     let previousBegin = Infinity;
@@ -259,7 +259,7 @@ describe("nextBackfillWindow", () => {
       to = w.begin;
       steps++;
     }
-    expect(steps).toBe(52);
+    expect(steps).toBe(9);
   });
 });
 
@@ -395,11 +395,11 @@ describe("Netatmo Weather plugin — hourly rain", () => {
     const p = plugin();
     await p.start();
     const first = Number(settings.get(`integration.netatmo_weather.rain_backfill.${rainModule._id}`));
-    expect(first).toBe(CURRENT_HOUR - 3 * H - 168 * H);
+    expect(first).toBe(CURRENT_HOUR - 3 * H - 1000 * H);
     await p.refresh!();
     await p.stop();
     expect(Number(settings.get(`integration.netatmo_weather.rain_backfill.${rainModule._id}`))).toBe(
-      first - 168 * H,
+      first - 1000 * H,
     );
   });
 
@@ -468,7 +468,7 @@ describe("Netatmo Weather plugin — hourly rain", () => {
     await p.refresh!();
     await p.stop();
     // third failure: the step is skipped, the next poll moves on
-    expect(Number(settings.get(SETTING("rain_backfill")))).toBe(CURRENT_HOUR - 3 * H - 168 * H);
+    expect(Number(settings.get(SETTING("rain_backfill")))).toBe(CURRENT_HOUR - 3 * H - 1000 * H);
   });
 
   it("sends an hour once more after it closes, even with the same total", async () => {

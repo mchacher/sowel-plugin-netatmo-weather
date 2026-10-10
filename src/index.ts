@@ -10,8 +10,8 @@
  * Netatmo's own hourly aggregate (getmeasure, sum_rain), never from the
  * dashboard's `Rain`, which is the latest 5-minute measure and cannot be
  * summed (the dashboard refreshes every ~10 minutes, so a poll every 5 reads
- * some measures twice and misses others). A year of hours is backfilled, one
- * week per poll.
+ * some measures twice and misses others). A year of hours is backfilled, 1000
+ * hours per poll (nine polls).
  *
  * Uses OAuth 2.0 with automatic token refresh and file persistence.
  */
@@ -211,8 +211,11 @@ const POLL_ALARM_ID = "netatmo-weather-poll";
 const RAIN_RECENT_HOURS = 3;
 /** How far back the backfill reaches, inside Sowel's one-year rain retention. */
 const RAIN_BACKFILL_DAYS = 364;
-/** Hours backfilled per poll, so the history is rewritten without flooding the core. */
-const RAIN_BACKFILL_STEP_HOURS = 7 * 24;
+/**
+ * Hours backfilled per poll: getmeasure returns at most 1024 values, so a year
+ * takes nine polls (~45 min at the default 5 min), newest weeks first.
+ */
+const RAIN_BACKFILL_STEP_HOURS = 1000;
 /** Consecutive failures of one backfill step before it is skipped, so it cannot stall forever. */
 const RAIN_BACKFILL_MAX_FAILURES = 3;
 /** How far back the recent read catches up after an outage (getmeasure returns at most 1024 values). */
@@ -294,7 +297,7 @@ export function parseRainHours(body: unknown): RainHour[] {
 }
 
 /**
- * Next backfill step: the week of hours just before `backfilledTo` (the oldest
+ * Next backfill step: the {@link RAIN_BACKFILL_STEP_HOURS} hours just before `backfilledTo` (the oldest
  * hour already backfilled, epoch s), or before the recent hours on the first
  * step. Null once the backfill has reached {@link RAIN_BACKFILL_DAYS}. `end`
  * reaches half an hour into the previous step, so the boundary hour is read

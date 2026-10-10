@@ -5,6 +5,14 @@
  * Discovers base station + outdoor/wind/rain/indoor modules.
  * Read-only — no orders.
  *
+ * Rain follows Sowel's per-hour contract: `rain` is the total of one clock
+ * hour, sent with `sourceTimestamp` = the hour start. The totals come from
+ * Netatmo's own hourly aggregate (getmeasure, sum_rain), never from the
+ * dashboard's `Rain`, which is the latest 5-minute measure and cannot be
+ * summed (the dashboard refreshes every ~10 minutes, so a poll every 5 reads
+ * some measures twice and misses others). A year of hours is backfilled, one
+ * week per poll.
+ *
  * Uses OAuth 2.0 with automatic token refresh and file persistence.
  */
 
@@ -67,6 +75,7 @@ interface DeviceManager {
     integrationId: string,
     sourceDeviceId: string,
     payload: Record<string, unknown>,
+    sourceTimestamp?: number,
   ): void;
   migrateIntegrationId(
     oldIntegrationId: string,
@@ -178,6 +187,12 @@ interface NetatmoDashboard {
   time_utc?: number;
 }
 
+/** getmeasure with optimize=false: `{ "<epoch s>": [value] }`. */
+interface NetatmoMeasureResponse {
+  body: Record<string, Array<number | null>>;
+  status: string;
+}
+
 // ============================================================
 // Constants
 // ============================================================
@@ -192,6 +207,12 @@ const DEFAULT_POLL_INTERVAL_MS = 300_000;
 /** Consecutive poll failures before raising a system alarm (~30 min at the 5-min cadence). */
 const POLL_FAILURE_ALARM_THRESHOLD = 6;
 const POLL_ALARM_ID = "netatmo-weather-poll";
+/** Hours re-read on every poll: Netatmo uploads late, and a poll can fail. */
+const RAIN_RECENT_HOURS = 3;
+/** How far back the backfill reaches, inside Sowel's one-year rain retention. */
+const RAIN_BACKFILL_DAYS = 364;
+/** Hours backfilled per poll, so the history is rewritten without flooding the core. */
+const RAIN_BACKFILL_STEP_HOURS = 7 * 24;
 
 const WEATHER_MODEL_NAMES: Record<string, string> = {
   NAMain: "Indoor Station",
@@ -237,6 +258,53 @@ export class PollFailureTracker {
     }
     return null;
   }
+}
+
+// ============================================================
+// Hourly rain (Sowel per-hour contract)
+// ============================================================
+
+export interface RainHour {
+  /** Start of the clock hour, epoch seconds. */
+  hourStart: number;
+  mm: number;
+}
+
+const floorHour = (s: number) => Math.floor(s / 3600) * 3600;
+
+/**
+ * Hourly rain totals from a getmeasure body, oldest first. Netatmo stamps an
+ * aggregate at its middle (start + scale/2) unless `real_time` is set, so the
+ * stamp is floored to the hour either way. Hours without a value are skipped.
+ */
+export function parseRainHours(body: unknown): RainHour[] {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return [];
+  const hours: RainHour[] = [];
+  for (const [ts, values] of Object.entries(body as Record<string, unknown>)) {
+    const t = Number(ts);
+    const mm = Array.isArray(values) ? values[0] : undefined;
+    if (!Number.isFinite(t) || typeof mm !== "number" || !Number.isFinite(mm)) continue;
+    hours.push({ hourStart: floorHour(t), mm });
+  }
+  return hours.sort((a, b) => a.hourStart - b.hourStart);
+}
+
+/**
+ * Next backfill step: the week of hours just before `backfilledTo` (the oldest
+ * hour already backfilled, epoch s), or before the recent hours on the first
+ * step. Null once the backfill has reached {@link RAIN_BACKFILL_DAYS}. `end` is
+ * one second before the previous step's start, so each hour, stamped at its
+ * middle, falls in exactly one step.
+ */
+export function nextBackfillWindow(
+  nowS: number,
+  backfilledTo: number | null,
+): { begin: number; end: number } | null {
+  const current = floorHour(nowS);
+  const from = backfilledTo ?? current - RAIN_RECENT_HOURS * 3600;
+  const limit = current - RAIN_BACKFILL_DAYS * 86_400;
+  if (from <= limit) return null;
+  return { begin: Math.max(from - RAIN_BACKFILL_STEP_HOURS * 3600, limit), end: from - 1 };
 }
 
 // ============================================================
@@ -286,6 +354,26 @@ export class NetatmoBridge {
 
   async getStationsData(): Promise<NetatmoStationsDataResponse> {
     return this.apiGet<NetatmoStationsDataResponse>("/api/getstationsdata");
+  }
+
+  /** Netatmo's hourly rain totals for a rain module, from `beginS` (to `endS`, else now). */
+  async getRainHours(
+    stationId: string,
+    moduleId: string,
+    beginS: number,
+    endS?: number,
+  ): Promise<RainHour[]> {
+    const query = new URLSearchParams({
+      device_id: stationId,
+      module_id: moduleId,
+      scale: "1hour",
+      type: "sum_rain",
+      date_begin: String(beginS),
+      optimize: "false",
+    });
+    if (endS !== undefined) query.set("date_end", String(endS));
+    const res = await this.apiGet<NetatmoMeasureResponse>(`/api/getmeasure?${query.toString()}`);
+    return parseRainHours(res.body);
   }
 
   private async doRefreshToken(): Promise<void> {
@@ -515,7 +603,8 @@ function extractDashboardPayload(
       if (dashboard.GustAngle !== undefined) payload.gust_angle = dashboard.GustAngle;
       break;
     case "NAModule3":
-      if (dashboard.Rain !== undefined) payload.rain = dashboard.Rain;
+      // `rain` is published per hour from getmeasure (see syncRainHours), not
+      // from the dashboard's 5-minute `Rain`.
       if (dashboard.sum_rain_1 !== undefined) payload.sum_rain_1 = dashboard.sum_rain_1;
       if (dashboard.sum_rain_24 !== undefined) payload.sum_rain_24 = dashboard.sum_rain_24;
       break;
@@ -554,6 +643,8 @@ class NetatmoWeatherPlugin implements IntegrationPlugin {
   private retryCount = 0;
   private migrationDone = false;
   private dataDir: string;
+  /** Rain hours last published, per module, so a poll only resends what changed. */
+  private publishedRain = new Map<string, Map<number, number>>();
 
   constructor(deps: PluginDeps) {
     this.logger = deps.logger;
@@ -726,6 +817,10 @@ class NetatmoWeatherPlugin implements IntegrationPlugin {
           modPayload.battery = mod.battery_percent;
         }
         this.deviceManager.updateDeviceData(INTEGRATION_ID, modName, modPayload);
+
+        if (mod.type === "NAModule3") {
+          await this.syncRainHours(station._id, mod._id, modName);
+        }
       }
     }
 
@@ -740,6 +835,64 @@ class NetatmoWeatherPlugin implements IntegrationPlugin {
         message: "Netatmo Weather polling recovered",
       });
     }
+  }
+
+  /**
+   * Publish Netatmo's hourly rain totals: one backfill step, then the recent
+   * hours, each with `sourceTimestamp` = its hour start. Sowel writes an hour
+   * that is already over straight to its hourly history, so a late or
+   * corrected hour, and the backfill, land where they belong. A failure here
+   * never fails the poll: the other readings are still good.
+   */
+  private async syncRainHours(stationId: string, moduleId: string, modName: string): Promise<void> {
+    if (!this.bridge) return;
+    const nowS = Math.floor(Date.now() / 1000);
+    try {
+      const key = `rain_backfill.${moduleId}`;
+      const saved = Number(this.getSetting(key));
+      const window = nextBackfillWindow(nowS, Number.isFinite(saved) && saved > 0 ? saved : null);
+      if (window) {
+        const hours = await this.bridge.getRainHours(stationId, moduleId, window.begin, window.end);
+        this.publishRainHours(moduleId, modName, hours, { onlyChanged: false });
+        this.settingsManager.set(`${SETTINGS_PREFIX}${key}`, String(window.begin));
+        this.logger.info(
+          { moduleId, hours: hours.length, from: new Date(window.begin * 1000).toISOString() },
+          "Rain history backfill step",
+        );
+      }
+
+      const recent = await this.bridge.getRainHours(
+        stationId,
+        moduleId,
+        floorHour(nowS) - RAIN_RECENT_HOURS * 3600,
+      );
+      this.publishRainHours(moduleId, modName, recent, { onlyChanged: true });
+    } catch (err) {
+      this.logger.warn({ err, moduleId } as Record<string, unknown>, "Hourly rain fetch failed");
+    }
+  }
+
+  /**
+   * Send rain hours oldest first. With `onlyChanged`, an hour already sent
+   * with the same total is skipped, except the newest: it is always sent last,
+   * so the device's live `rain` ends on the latest hour, not on a backfilled one.
+   */
+  private publishRainHours(
+    moduleId: string,
+    modName: string,
+    hours: RainHour[],
+    { onlyChanged }: { onlyChanged: boolean },
+  ): void {
+    const sent = this.publishedRain.get(moduleId) ?? new Map<number, number>();
+    hours.forEach((h, i) => {
+      const newest = i === hours.length - 1;
+      if (onlyChanged && !newest && sent.get(h.hourStart) === h.mm) return;
+      this.deviceManager.updateDeviceData(INTEGRATION_ID, modName, { rain: h.mm }, h.hourStart);
+      if (onlyChanged) sent.set(h.hourStart, h.mm);
+    });
+    const cutoff = floorHour(Date.now() / 1000) - (RAIN_RECENT_HOURS + 1) * 3600;
+    for (const hourStart of sent.keys()) if (hourStart < cutoff) sent.delete(hourStart);
+    this.publishedRain.set(moduleId, sent);
   }
 
   private safePoll(): void {

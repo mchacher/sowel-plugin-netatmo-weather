@@ -13,6 +13,12 @@
  * some measures twice and misses others). A year of hours is backfilled, 1000
  * hours per poll (nine polls).
  *
+ * Netatmo's `sum_rain_24` is the rain since local midnight despite its name
+ * (it drops to 0 at midnight). In Sowel `sum_rain_24` is the rolling 24 hours
+ * and the since-midnight figure is `rain_today` (sowel#1037): Netatmo's value
+ * is published as `rain_today`, and `sum_rain_24` is the sum of the last 24
+ * hourly totals.
+ *
  * Uses OAuth 2.0 with automatic token refresh and file persistence.
  */
 
@@ -207,8 +213,11 @@ const DEFAULT_POLL_INTERVAL_MS = 300_000;
 /** Consecutive poll failures before raising a system alarm (~30 min at the 5-min cadence). */
 const POLL_FAILURE_ALARM_THRESHOLD = 6;
 const POLL_ALARM_ID = "netatmo-weather-poll";
-/** Hours re-read on every poll: Netatmo uploads late, and a poll can fail. */
-const RAIN_RECENT_HOURS = 3;
+/**
+ * Hours re-read on every poll, before the current one: they cover the rolling
+ * 24 hours (`sum_rain_24`), late uploads from Netatmo and a failed poll.
+ */
+const RAIN_RECENT_HOURS = 23;
 /** How far back the backfill reaches, inside Sowel's one-year rain retention. */
 const RAIN_BACKFILL_DAYS = 364;
 /**
@@ -313,6 +322,16 @@ export function nextBackfillWindow(
   const limit = current - RAIN_BACKFILL_DAYS * 86_400;
   if (from <= limit) return null;
   return { begin: Math.max(from - RAIN_BACKFILL_STEP_HOURS * 3600, limit), end: from + 1800 };
+}
+
+/**
+ * Rain over the rolling 24 hours, to the hour: the current hour so far plus
+ * the {@link RAIN_RECENT_HOURS} before it. Hours without a total had no rain.
+ */
+export function rolling24h(hours: RainHour[], nowS: number): number {
+  const first = floorHour(nowS) - RAIN_RECENT_HOURS * 3600;
+  const sum = hours.filter((h) => h.hourStart >= first).reduce((acc, h) => acc + h.mm, 0);
+  return Math.round(sum * 1000) / 1000;
 }
 
 /**
@@ -581,6 +600,7 @@ function mapModuleToDiscovered(mod: NetatmoStationModule): DiscoveredDevice {
       data.push({ key: "rain", type: "number", category: "rain", unit: "mm" });
       data.push({ key: "sum_rain_1", type: "number", category: "rain", unit: "mm" });
       data.push({ key: "sum_rain_24", type: "number", category: "rain", unit: "mm" });
+      data.push({ key: "rain_today", type: "number", category: "rain", unit: "mm" });
       break;
     case "NAModule4":
       data.push({ key: "temperature", type: "number", category: "temperature", unit: "°C" });
@@ -626,7 +646,9 @@ function extractDashboardPayload(
       // `rain` is published per hour from getmeasure (see syncRainHours), not
       // from the dashboard's 5-minute `Rain`.
       if (dashboard.sum_rain_1 !== undefined) payload.sum_rain_1 = dashboard.sum_rain_1;
-      if (dashboard.sum_rain_24 !== undefined) payload.sum_rain_24 = dashboard.sum_rain_24;
+      // Netatmo's sum_rain_24 is the rain since midnight: Sowel's rain_today.
+      // sum_rain_24, the rolling 24 hours, is summed from the hourly totals.
+      if (dashboard.sum_rain_24 !== undefined) payload.rain_today = dashboard.sum_rain_24;
       break;
     case "NAModule4":
       if (dashboard.Temperature !== undefined) payload.temperature = dashboard.Temperature;
@@ -865,8 +887,9 @@ class NetatmoWeatherPlugin implements IntegrationPlugin {
    * Publish Netatmo's hourly rain totals: one backfill step, then the recent
    * hours, each with `sourceTimestamp` = its hour start. Sowel writes an hour
    * that is already over straight to its hourly history, so a late or
-   * corrected hour, and the backfill, land where they belong. The two reads
-   * fail apart, and neither fails the poll: the other readings are still good.
+   * corrected hour, and the backfill, land where they belong. The recent read
+   * also gives the rolling 24 hours (`sum_rain_24`). The two reads fail apart,
+   * and neither fails the poll: the other readings are still good.
    */
   private async syncRainHours(stationId: string, moduleId: string, modName: string): Promise<void> {
     if (!this.bridge) return;
@@ -882,6 +905,9 @@ class NetatmoWeatherPlugin implements IntegrationPlugin {
         recentReadStart(nowS, Number.isFinite(synced) && synced > 0 ? synced : null),
       );
       this.publishRecentRainHours(moduleId, modName, recent, nowS);
+      this.deviceManager.updateDeviceData(INTEGRATION_ID, modName, {
+        sum_rain_24: rolling24h(recent, nowS),
+      });
       const newest = recent[recent.length - 1];
       if (newest) this.settingsManager.set(`${SETTINGS_PREFIX}${syncedKey}`, String(newest.hourStart));
     } catch (err) {
